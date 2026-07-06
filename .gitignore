@@ -1,0 +1,58 @@
+build/
+cmake-build-*/
+.cache/
+compile_commands.json
+ref/
+
+# Binary
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Personal AI tool state
+.codex
+.codex/
+.claude/
+.aider*
+.ai-scratch/
+.ai-cache/
+.ai-logs/
+.llm-cache/
+.llm-logs/
+
+# Local LLM / agent logs, plans, traces
+.agent/
+.agents/
+.ai/
+.ai-work/
+.ai-scratch/
+.ai-cache/
+.ai-logs/
+.llm/
+.llm-cache/
+.llm-logs/
+.plans/
+plans/
+tasks/
+scratch/
+tmp/
+temp/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Secrets (good to have, prevents human error)
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.*
+.secrets/

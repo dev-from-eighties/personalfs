@@ -1,0 +1,18 @@
+# PersonalFS work directory configuration.
+# Sizes accept B, K, M, G, T suffixes. Raw numbers are bytes.
+
+storage_root = "pfs-data"
+image_name = "personal.img"
+runtime_mount_name = "mounted-img"
+
+quota_size = "100G"
+initial_size = "1G"
+resize_mode = "fibonacci" # "static" or "fibonacci"
+static_step = "1G"
+fibonacci_max_step = "32G"
+grow_free_threshold = "256M"
+
+adaptive_shrink = true
+shrink_on_unmount = true
+shrink_free_threshold = "2G"
+shrink_min_reclaim = "1G"
