@@ -1,238 +1,364 @@
+#define FUSE_USE_VERSION 35
 #include "fuse/FuseMain.hpp"
-
-#define FUSE_USE_VERSION 31
+#include <algorithm>
+#include <cstring>
+#include <fcntl.h>
 #include <fuse3/fuse.h>
-
-#include "fuse/Operations.hpp"
-
-#include <cerrno>
-#include <cstddef>
-#include <cstdint>
-
-namespace personalfs::fuse {
-
-namespace {
-
-Operations& operations()
+#include <sys/xattr.h>
+#include <unistd.h>
+namespace personalfs
 {
-    return *static_cast<Operations*>(fuse_get_context()->private_data);
+namespace
+{
+Store &store()
+{
+    return *static_cast<Store *>(fuse_get_context()->private_data);
 }
-
-int pfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi)
+template <class F> int call(F &&f)
 {
-    (void)fi;
-    return operations().getattr(path, st);
-}
-
-int pfs_access(const char* path, int mask)
-{
-    return operations().access(path, mask);
-}
-
-int pfs_readlink(const char* path, char* buffer, std::size_t size)
-{
-    return operations().readlink(path, buffer, size);
-}
-
-int pfs_opendir(const char* path, struct fuse_file_info* fi)
-{
-    std::uint64_t handle = 0;
-    const int result = operations().opendir(path, &handle);
-    if (result == 0) {
-        fi->fh = handle;
+    try
+    {
+        return f();
     }
-    return result;
-}
-
-int pfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi, enum fuse_readdir_flags flags)
-{
-    (void)offset;
-    (void)fi;
-    (void)flags;
-    return operations().readdir(path, buffer, reinterpret_cast<void*>(filler));
-}
-
-int pfs_releasedir(const char* path, struct fuse_file_info* fi)
-{
-    (void)path;
-    return operations().releasedir(fi->fh);
-}
-
-int pfs_fsyncdir(const char* path, int datasync, struct fuse_file_info* fi)
-{
-    return operations().fsyncdir(path, fi != nullptr ? fi->fh : 0, datasync != 0);
-}
-
-int pfs_mknod(const char* path, mode_t mode, dev_t rdev)
-{
-    return operations().mknod(path, mode, rdev);
-}
-
-int pfs_mkdir(const char* path, mode_t mode)
-{
-    return operations().mkdir(path, mode);
-}
-
-int pfs_unlink(const char* path)
-{
-    return operations().unlink(path);
-}
-
-int pfs_rmdir(const char* path)
-{
-    return operations().rmdir(path);
-}
-
-int pfs_symlink(const char* target, const char* linkPath)
-{
-    return operations().symlink(target, linkPath);
-}
-
-int pfs_rename(const char* from, const char* to, unsigned int flags)
-{
-    return operations().rename(from, to, flags);
-}
-
-int pfs_link(const char* from, const char* to)
-{
-    return operations().link(from, to);
-}
-
-int pfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi)
-{
-    (void)fi;
-    return operations().chmod(path, mode);
-}
-
-int pfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi)
-{
-    (void)fi;
-    return operations().chown(path, uid, gid);
-}
-
-int pfs_truncate(const char* path, off_t size, struct fuse_file_info* fi)
-{
-    return operations().truncate(path, size, fi != nullptr ? static_cast<int>(fi->fh) : -1);
-}
-
-int pfs_open(const char* path, struct fuse_file_info* fi)
-{
-    std::uint64_t handle = 0;
-    const int result = operations().open(path, fi->flags, &handle);
-    if (result == 0) {
-        fi->fh = handle;
+    catch (const std::system_error &e)
+    {
+        store().recordError(e.code().value(), e.what());
+        return -e.code().value();
     }
-    return result;
-}
-
-int pfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
-{
-    std::uint64_t handle = 0;
-    const int result = operations().create(path, mode, fi->flags, &handle);
-    if (result == 0) {
-        fi->fh = handle;
+    catch (const std::bad_alloc &)
+    {
+        return -ENOMEM;
     }
-    return result;
+    catch (...)
+    {
+        return -EIO;
+    }
 }
-
-int pfs_read(const char* path, char* buffer, std::size_t size, off_t offset, struct fuse_file_info* fi)
+Handle &handle(fuse_file_info *fi)
 {
-    (void)path;
-    return operations().read(fi->fh, buffer, size, offset);
+    return *reinterpret_cast<Handle *>(fi->fh);
 }
-
-int pfs_write(const char* path, const char* buffer, std::size_t size, off_t offset, struct fuse_file_info* fi)
+Id id(const char *path, fuse_file_info *fi)
 {
-    (void)path;
-    return operations().write(fi->fh, buffer, size, offset);
+    return fi ? handle(fi).id : store().resolve(path);
 }
-
-int pfs_release(const char* path, struct fuse_file_info* fi)
+int getAttr(const char *path, struct stat *st, fuse_file_info *fi)
 {
-    (void)path;
-    return operations().release(fi->fh);
+    return call(
+        [&]
+        {
+            *st = store().getattr(id(path, fi), fi ? handle(fi).fd.get() : -1);
+            return 0;
+        });
 }
-
-int pfs_fsync(const char* path, int datasync, struct fuse_file_info* fi)
+int openFile(const char *path, fuse_file_info *fi)
 {
-    (void)path;
-    return operations().fsync(fi->fh, datasync != 0);
+    return call(
+        [&]
+        {
+            fi->fh =
+                reinterpret_cast<std::uint64_t>(store().open(store().resolve(path), fi->flags).release());
+            return 0;
+        });
 }
-
-int pfs_fallocate(const char* path, int mode, off_t offset, off_t length, struct fuse_file_info* fi)
+int createFile(const char *path, mode_t mode, fuse_file_info *fi)
 {
-    return operations().fallocate(path, mode, offset, length, fi != nullptr ? static_cast<int>(fi->fh) : -1);
+    return call(
+        [&]
+        {
+            auto c = fuse_get_context();
+            auto h = store().createOpen(path, mode, c->uid, c->gid, fi->flags);
+            fi->fh = reinterpret_cast<std::uint64_t>(h.release());
+            return 0;
+        });
 }
-
-int pfs_setxattr(const char* path, const char* name, const char* value, std::size_t size, int flags)
+int releaseFile(const char *, fuse_file_info *fi)
 {
-    return operations().setxattr(path, name, value, size, flags);
+    return call(
+        [&]
+        {
+            store().release(std::unique_ptr<Handle>(&handle(fi)));
+            fi->fh = 0;
+            return 0;
+        });
 }
-
-int pfs_getxattr(const char* path, const char* name, char* value, std::size_t size)
+int readFile(const char *, char *b, size_t n, off_t off, fuse_file_info *fi)
 {
-    return operations().getxattr(path, name, value, size);
+    return call([&] { return static_cast<int>(store().read(handle(fi), b, n, off)); });
 }
-
-int pfs_listxattr(const char* path, char* list, std::size_t size)
+int writeFile(const char *, const char *b, size_t n, off_t off, fuse_file_info *fi)
 {
-    return operations().listxattr(path, list, size);
+    return call([&] { return static_cast<int>(store().write(handle(fi), b, n, off)); });
 }
-
-int pfs_removexattr(const char* path, const char* name)
+int syncFile(const char *, int dataOnly, fuse_file_info *fi)
 {
-    return operations().removexattr(path, name);
+    return call(
+        [&]
+        {
+            store().sync(handle(fi), dataOnly);
+            return 0;
+        });
 }
-
-int pfs_utimens(const char* path, const struct timespec tv[2], struct fuse_file_info* fi)
+int flushFile(const char *, fuse_file_info *fi)
 {
-    return operations().utimens(path, tv, fi != nullptr ? static_cast<int>(fi->fh) : -1);
+    return call(
+        [&]
+        {
+            int fd = ::dup(handle(fi).fd.get());
+            if (fd < 0)
+                fail(errno, "flush dup");
+            if (::close(fd))
+                fail(errno, "flush close");
+            return 0;
+        });
 }
-
-int pfs_statfs(const char* path, struct statvfs* st)
+int makeDir(const char *path, mode_t mode)
 {
-    (void)path;
-    return operations().statfs(st);
+    return call(
+        [&]
+        {
+            auto c = fuse_get_context();
+            store().create(path, Kind::Directory, mode, c->uid, c->gid);
+            return 0;
+        });
 }
-
+int unlinkFile(const char *path)
+{
+    return call(
+        [&]
+        {
+            store().remove(path, false);
+            return 0;
+        });
+}
+int removeDir(const char *path)
+{
+    return call(
+        [&]
+        {
+            store().remove(path, true);
+            return 0;
+        });
+}
+int renameEntry(const char *a, const char *b, unsigned flags)
+{
+    return call(
+        [&]
+        {
+            store().rename(a, b, flags);
+            return 0;
+        });
+}
+int truncateFile(const char *path, off_t size, fuse_file_info *fi)
+{
+    return call(
+        [&]
+        {
+            store().truncate(id(path, fi), size, fi ? handle(fi).fd.get() : -1);
+            return 0;
+        });
+}
+int openDir(const char *path, fuse_file_info *fi)
+{
+    return call(
+        [&]
+        {
+            fi->fh = reinterpret_cast<std::uint64_t>(store().openDirectory(store().resolve(path)).release());
+            return 0;
+        });
+}
+int readDir(const char *, void *buffer, fuse_fill_dir_t filler, off_t offset, fuse_file_info *fi,
+            fuse_readdir_flags)
+{
+    return call(
+        [&]
+        {
+            if (offset < 0)
+                fail(EINVAL, "readdir cookie");
+            auto &d = handle(fi);
+            for (std::size_t i = offset; i < d.snapshot.size(); ++i)
+            {
+                struct stat st{};
+                st.st_ino = d.snapshot[i].second.id + 1;
+                st.st_mode = typeMode(d.snapshot[i].second.kind);
+                if (filler(buffer, d.snapshot[i].first.c_str(), &st, i + 1,
+                           static_cast<fuse_fill_dir_flags>(0)))
+                    break;
+            }
+            return 0;
+        });
+}
+int releaseDir(const char *path, fuse_file_info *fi)
+{
+    return releaseFile(path, fi);
+}
+int syncDir(const char *, int, fuse_file_info *fi)
+{
+    return call(
+        [&]
+        {
+            store().syncDirectory(handle(fi).id);
+            return 0;
+        });
+}
+int statFs(const char *, struct statvfs *st)
+{
+    return call(
+        [&]
+        {
+            *st = store().statfs();
+            return 0;
+        });
+}
+int symbolicLink(const char *target, const char *path)
+{
+    return call(
+        [&]
+        {
+            auto c = fuse_get_context();
+            store().create(path, Kind::Symlink, 0777, c->uid, c->gid, target);
+            return 0;
+        });
+}
+int readLink(const char *path, char *buffer, size_t size)
+{
+    return call(
+        [&]
+        {
+            auto target = store().readlink(store().resolve(path));
+            if (!size)
+                fail(EINVAL, "readlink buffer");
+            auto n = std::min(target.size(), size - 1);
+            std::memcpy(buffer, target.data(), n);
+            buffer[n] = 0;
+            return 0;
+        });
+}
+void owner(Id obj)
+{
+    auto c = fuse_get_context();
+    if (c->uid && c->uid != store().metadata(obj).uid)
+        fail(EPERM, "owner required");
+}
+int chmodFile(const char *path, mode_t mode, fuse_file_info *fi)
+{
+    return call(
+        [&]
+        {
+            auto obj = id(path, fi);
+            owner(obj);
+            store().attributes(obj, mode, {}, {});
+            return 0;
+        });
+}
+int chownFile(const char *path, uid_t uid, gid_t gid, fuse_file_info *fi)
+{
+    return call(
+        [&]
+        {
+            auto obj = id(path, fi);
+            auto c = fuse_get_context();
+            auto m = store().metadata(obj);
+            if (c->uid)
+            {
+                owner(obj);
+                if (uid != static_cast<uid_t>(-1) && uid != m.uid)
+                    fail(EPERM, "changing owner requires root");
+                if (gid != static_cast<gid_t>(-1) && gid != m.gid && gid != c->gid)
+                {
+                    int count = fuse_getgroups(0, nullptr);
+                    if (count < 0)
+                        fail(EPERM, "cannot verify groups");
+                    std::vector<gid_t> groups(count);
+                    if (fuse_getgroups(count, groups.data()) < 0 ||
+                        std::find(groups.begin(), groups.end(), gid) == groups.end())
+                        fail(EPERM, "group membership required");
+                }
+            }
+            store().attributes(obj, {}, uid == static_cast<uid_t>(-1) ? std::optional<uid_t>{} : uid,
+                               gid == static_cast<gid_t>(-1) ? std::optional<gid_t>{} : gid);
+            return 0;
+        });
+}
+int utimensFile(const char *path, const timespec times[2], fuse_file_info *fi)
+{
+    return call(
+        [&]
+        {
+            store().times(id(path, fi), times);
+            return 0;
+        });
+}
+int getXattr(const char *path, const char *name, char *value, size_t size)
+{
+    return call(
+        [&]
+        {
+            if (std::strcmp(path, "/") || std::strcmp(name, "user.personalfs.stats"))
+                fail(EOPNOTSUPP, "xattrs unsupported");
+            auto json = store().statistics();
+            if (!size)
+                return static_cast<int>(json.size());
+            if (size < json.size())
+                fail(ERANGE, "stats buffer");
+            std::memcpy(value, json.data(), json.size());
+            return static_cast<int>(json.size());
+        });
+}
+void *init(fuse_conn_info *conn, fuse_config *config)
+{
+    config->use_ino = 1;
+    config->entry_timeout = 0;
+    config->attr_timeout = 0;
+    config->negative_timeout = 0;
+    config->nullpath_ok = 1;
+    config->hard_remove = 1;
+    conn->want &= ~FUSE_CAP_WRITEBACK_CACHE;
+    return &store();
+}
 } // namespace
-
-int runFuse(int argc, char** argv, storage::ImageManager& imageManager)
+int mount(Store &backend, const std::string &mountpoint, const std::vector<std::string> &options)
 {
-    Operations ops{imageManager};
-    fuse_operations callbacks {};
-    callbacks.getattr = pfs_getattr;
-    callbacks.access = pfs_access;
-    callbacks.readlink = pfs_readlink;
-    callbacks.opendir = pfs_opendir;
-    callbacks.readdir = pfs_readdir;
-    callbacks.releasedir = pfs_releasedir;
-    callbacks.fsyncdir = pfs_fsyncdir;
-    callbacks.mknod = pfs_mknod;
-    callbacks.mkdir = pfs_mkdir;
-    callbacks.unlink = pfs_unlink;
-    callbacks.rmdir = pfs_rmdir;
-    callbacks.symlink = pfs_symlink;
-    callbacks.rename = pfs_rename;
-    callbacks.link = pfs_link;
-    callbacks.chmod = pfs_chmod;
-    callbacks.chown = pfs_chown;
-    callbacks.truncate = pfs_truncate;
-    callbacks.open = pfs_open;
-    callbacks.create = pfs_create;
-    callbacks.read = pfs_read;
-    callbacks.write = pfs_write;
-    callbacks.release = pfs_release;
-    callbacks.fsync = pfs_fsync;
-    callbacks.fallocate = pfs_fallocate;
-    callbacks.setxattr = pfs_setxattr;
-    callbacks.getxattr = pfs_getxattr;
-    callbacks.listxattr = pfs_listxattr;
-    callbacks.removexattr = pfs_removexattr;
-    callbacks.utimens = pfs_utimens;
-    callbacks.statfs = pfs_statfs;
-
-    return fuse_main(argc, argv, &callbacks, &ops);
+    fuse_operations ops{};
+    ops.init = init;
+    ops.getattr = getAttr;
+    ops.open = openFile;
+    ops.create = createFile;
+    ops.read = readFile;
+    ops.write = writeFile;
+    ops.release = releaseFile;
+    ops.flush = flushFile;
+    ops.fsync = syncFile;
+    ops.mkdir = makeDir;
+    ops.unlink = unlinkFile;
+    ops.rmdir = removeDir;
+    ops.rename = renameEntry;
+    ops.truncate = truncateFile;
+    ops.opendir = openDir;
+    ops.readdir = readDir;
+    ops.releasedir = releaseDir;
+    ops.fsyncdir = syncDir;
+    ops.statfs = statFs;
+    ops.symlink = symbolicLink;
+    ops.readlink = readLink;
+    ops.chmod = chmodFile;
+    ops.chown = chownFile;
+    ops.utimens = utimensFile;
+    ops.getxattr = getXattr;
+    ops.link = [](const char *, const char *) { return -EOPNOTSUPP; };
+    ops.mknod = [](const char *, mode_t, dev_t) { return -EOPNOTSUPP; };
+    ops.setxattr = [](const char *, const char *, const char *, size_t, int) { return -EOPNOTSUPP; };
+    ops.removexattr = [](const char *, const char *) { return -EOPNOTSUPP; };
+    ops.listxattr = [](const char *, char *, size_t) { return -EOPNOTSUPP; };
+    ops.fallocate = [](const char *, int, off_t, off_t, fuse_file_info *) { return -EOPNOTSUPP; };
+    std::vector<std::string> args{"personalfs", mountpoint, "-o", "default_permissions,fsname=personalfs-v2"};
+    args.insert(args.end(), options.begin(), options.end());
+    std::vector<char *> argv;
+    for (auto &a : args)
+        argv.push_back(a.data());
+    auto result = fuse_main(argv.size(), argv.data(), &ops, &backend);
+    if (result == 0)
+        backend.shutdown();
+    return result;
 }
-
-} // namespace personalfs::fuse
+} // namespace personalfs
