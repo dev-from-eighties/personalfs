@@ -37,3 +37,10 @@ target_compile_options(personalfs_core PRIVATE
 add_executable(personalfs src/main.cpp)
 target_link_libraries(personalfs PRIVATE personalfs_core)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(shrink_regression tests/ShrinkRegression.cpp)
+    target_link_libraries(shrink_regression PRIVATE personalfs_core)
+    target_link_options(shrink_regression PRIVATE -Wl,--wrap=ioctl -Wl,--wrap=statvfs)
+    add_test(NAME shrink_regression COMMAND shrink_regression)
+endif()

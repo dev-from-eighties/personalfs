@@ -9,6 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
+#include <linux/btrfs.h>
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -181,6 +184,26 @@ std::uint64_t ImageManager::imageSize() const
     return size;
 }
 
+std::uint64_t ImageManager::btrfsDeviceSize() const
+{
+    const int fd = ::open(paths_.internalMount.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        throw util::Error(std::string{"could not open btrfs mount: "} + std::strerror(errno));
+    }
+    struct btrfs_ioctl_fs_info_args fs {};
+    struct btrfs_ioctl_dev_info_args device {};
+    device.devid = 1; // Images created by PersonalFS contain a single device, id 1.
+    const bool valid = ::ioctl(fd, BTRFS_IOC_FS_INFO, &fs) == 0
+        && fs.num_devices == 1
+        && ::ioctl(fd, BTRFS_IOC_DEV_INFO, &device) == 0
+        && device.total_bytes > 0;
+    ::close(fd);
+    if (!valid) {
+        throw util::Error("could not determine single-device btrfs size; refusing to shrink image");
+    }
+    return device.total_bytes;
+}
+
 void ImageManager::setVerbose(bool verbose)
 {
     verbose_ = verbose;
@@ -340,6 +363,7 @@ void ImageManager::maybeShrink()
     }
 
     std::scoped_lock lock{mutex_};
+    requireOk({"btrfs", "filesystem", "sync", paths_.internalMount.string()}, "btrfs sync before shrink");
     const auto current = spaceInfo();
     if (verbose_) {
         const auto reserve = btrfsShrinkReserve(current.used, config_.growFreeThreshold);
@@ -354,7 +378,7 @@ void ImageManager::maybeShrink()
     }
 
     const auto currentImageSize = imageSize();
-    const auto target = shrinkTarget(currentImageSize, current.used);
+    const auto target = shrinkTarget(btrfsDeviceSize(), current.used);
     if (target >= currentImageSize || currentImageSize - target < config_.shrinkMinReclaim) {
         return;
     }
@@ -364,9 +388,10 @@ void ImageManager::maybeShrink()
 void ImageManager::shrinkToFit()
 {
     std::scoped_lock lock{mutex_};
+    requireOk({"btrfs", "filesystem", "sync", paths_.internalMount.string()}, "btrfs sync before shrink");
     const auto current = spaceInfo();
     const auto currentImageSize = imageSize();
-    const auto target = shrinkTarget(currentImageSize, current.used);
+    const auto target = shrinkTarget(btrfsDeviceSize(), current.used);
     if (verbose_) {
         const auto reserve = btrfsShrinkReserve(current.used, config_.growFreeThreshold);
         util::Logger::info(
@@ -420,16 +445,29 @@ void ImageManager::resizeBtrfsToMax()
 
 void ImageManager::shrinkTo(std::uint64_t targetSize)
 {
-    targetSize = std::max(config_.initialSize, alignUpMiB(targetSize));
+    // The backing file can be larger after a failed growth. Never interpret its
+    // length (or statvfs capacity) as the current Btrfs device size.
+    const auto deviceSize = btrfsDeviceSize();
+    targetSize = std::min(deviceSize, std::max(config_.initialSize, alignUpMiB(targetSize)));
+    if (targetSize >= imageSize()) {
+        return;
+    }
     util::Logger::info("personalfs: shrinking image to " + app::formatSize(targetSize));
 
-    requireOk({"btrfs", "filesystem", "resize", sizeForBtrfs(targetSize), paths_.internalMount.string()}, "btrfs shrink");
-
+    if (targetSize < deviceSize) {
+        requireOk({"btrfs", "filesystem", "resize", sizeForBtrfs(targetSize), paths_.internalMount.string()}, "btrfs shrink");
+    }
+    // Verify the committed device boundary before truncating its backing file.
+    requireOk({"btrfs", "filesystem", "sync", paths_.internalMount.string()}, "btrfs sync after shrink");
+    if (btrfsDeviceSize() > targetSize) {
+        throw util::Error("btrfs device still exceeds shrink target; refusing to truncate image");
+    }
     std::error_code error;
     std::filesystem::resize_file(paths_.image, targetSize, error);
     if (error) {
         throw util::Error("could not shrink image file: " + error.message());
     }
+    resizeLoopDevice();
 }
 
 } // namespace personalfs::storage

@@ -42,6 +42,7 @@ private:
     std::uint64_t fibonacciStepForSize(std::uint64_t currentSize) const;
     std::uint64_t growthTarget(std::uint64_t currentSize, std::uint64_t usedAfterWrite) const;
     std::uint64_t shrinkTarget(std::uint64_t currentSize, std::uint64_t used) const;
+    std::uint64_t btrfsDeviceSize() const;
     void growTo(std::uint64_t targetSize);
     void resizeBtrfsToMax();
     void resizeLoopDevice();

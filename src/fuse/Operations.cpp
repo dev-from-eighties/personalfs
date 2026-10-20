@@ -544,7 +544,8 @@ int Operations::truncate(const char* path, off_t size, int fd)
         }
 
         int result = fd >= 0 ? ::ftruncate(fd, size) : ::truncate(fullPath(path).c_str(), size);
-        if (result != 0 && errno == ENOSPC && imageManager_.growAfterNoSpace(static_cast<std::uint64_t>(size))) {
+        if (result != 0 && errno == ENOSPC && size > st.st_size
+            && imageManager_.growAfterNoSpace(static_cast<std::uint64_t>(size - st.st_size))) {
             result = fd >= 0 ? ::ftruncate(fd, size) : ::truncate(fullPath(path).c_str(), size);
         }
         if (result != 0) {
@@ -860,7 +861,13 @@ void Operations::prepareWrite(std::uint64_t handle, std::size_t size, off_t offs
 
 void Operations::maybeShrinkAfterDelete()
 {
-    imageManager_.maybeShrink();
+    try {
+        imageManager_.maybeShrink();
+    } catch (const std::exception& error) {
+        // The deletion has already succeeded. Maintenance must not turn it into
+        // a failed FUSE request (and leave the caller with a stale directory entry).
+        util::Logger::error(std::string{"WARNING: adaptive shrink skipped: "} + error.what());
+    }
 }
 
 } // namespace personalfs::fuse

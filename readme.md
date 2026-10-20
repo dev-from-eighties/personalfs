@@ -1,5 +1,9 @@
 # PersonalFS
 
+Notes: consider using the experimental branch lab_fast_answer, that removes the
+need for a .img file with a full fs inside, and implements a faster and safer
+alternative. It includes specs and it is powered by IA assisted coding.
+
 PersonalFS automates the following:
 
 - It creates and manages, for you, a personal.img file with a btrfs inside.
@@ -32,6 +36,12 @@ There are no background resize tasks. Resize decisions happen while serving IO:
   grow the image when free space is below the configured threshold.
 - Deletes and truncates may shrink the image only when enough space can be
   reclaimed to justify the operation.
+- Shrink targets use the actual Btrfs device size, even when a failed resize
+  leaves the backing image larger. The backing file is truncated only after
+  verifying the filesystem boundary, then the loop capacity is refreshed.
+  Shrink failures are logged and do not turn a completed deletion into an IO
+  error. Btrfs can still refuse a shrink when it lacks space for relocation;
+  later deletions retry the adaptive shrink.
 - `adaptive_shrink = false` disables shrink checks during normal IO. With
   `shrink_on_unmount = true`, PersonalFS still shrinks once while unmounting.
   You can also run `personalfs shrink <workdir>` explicitly during server
