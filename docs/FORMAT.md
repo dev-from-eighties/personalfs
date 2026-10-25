@@ -1,7 +1,7 @@
-# PersonalFS v2 prototype format (2.0)
+# PersonalFS v2 prototype format (2.1)
 
 This document records implementation decisions supplementing `PersonalFSv2_SPEC.md`.
-Format 2.0 is experimental and is not compatible with v1. All integers are unsigned
+Format 2.1 is experimental and is not compatible with v1. All integers are unsigned
 little-endian except timestamp seconds, which use signed 64-bit two's-complement.
 No native C++ structs are written to disk. Strings carry explicit lengths and raw
 bytes. Checksums use CRC32C/Castagnoli, reflected polynomial `0x82f63b78`, initial
@@ -13,6 +13,8 @@ and final XOR `0xffffffff` (`123456789` → `0xe3069283`).
 STORE/superblock
 STORE/lock
 STORE/journal
+STORE/pending/ID                 # empty durable deletion markers
+STORE/staging/.pfs-*.tmp         # unpublished replacements
 STORE/0.obj
 STORE/0.meta
 STORE/0000000000000000/1.obj
@@ -31,8 +33,9 @@ Physical access uses retained directory descriptors and `openat`/`renameat`, wit
 on `lock`. Offline readers also require this lock to obtain a coherent view.
 
 Temporary names start `.pfs-`, are unique to the process/operation, and end `.tmp`.
-They are created beside the publication target, never outside STORE. Publication
-uses write, fsync(temp), renameat(temp,target), fsync(containing directory).
+They are created in STORE/staging, on the same filesystem as publication targets.
+Publication uses write, fsync(temp), renameat(temp,target), fsync(target directory),
+fsync(staging). Only staging is enumerated for abandoned temporaries on mount.
 Root and pages are fsynced when created. Init also syncs the store's parent.
 Each object uses at most two permanent page entries; inspect includes temporary
 entries when reporting occupancy.
@@ -54,7 +57,7 @@ no accepted trailing garbage in a published fixed structure.
 
 ### Superblock: `PFS2SUPR`
 
-Payload: `major:u32=2, minor:u32=0, objects_per_page:u32, page_encoding:u32=16,
+Payload: `major:u32=2, minor:u32=1, objects_per_page:u32, page_encoding:u32=16,
 root_id:u64=0, next_object_id:u64, next_transaction_id:u64, flags:u64=0`.
 Total size: 64 bytes. Here encoding 16 means lowercase hexadecimal, width 16;
 no other encoding is accepted. Unsupported versions/flags are rejected.
@@ -161,7 +164,8 @@ containing directories have been synced.
   may be completed. A torn suffix belonging to uncommitted BEGIN can be rebuilt;
   a different valid/checksummed record is rejected. A COMMIT with a truncated or
   differing suffix is an integrity error. Bytes before the original EOF are never
-  truncated or rewritten. After replay, normal log validation checks the result.
+  truncated or rewritten. Replay validates the introduced references; full log
+  validation happens on directory access or explicit fsck.
 
 Recovery replays all actions, validates affected references, then publishes empty
 DONE. Repeating recovery is idempotent. Directory locks are held through the whole
@@ -188,3 +192,24 @@ reordering or devices that lie about fsync. Controlled power cuts, real ENOSPC/
 inode exhaustion on the selected encrypted host filesystem, mounted POSIX tests,
 and HDD/SMB workload measurements remain required before declaring this format
 production-stable. See the repository specification for the P0/P1 acceptance matrix.
+
+## Mount recovery and upgrading 2.0 stores
+
+Writable opens of 2.0 stores recover the transaction journal, perform the legacy
+full cleanup once, then durably publish minor version 1. Migration retains object
+IDs, data files and directory logs in place. It holds the exclusive store lock.
+Interrupted migration is repeatable; the version gate is published last. Old
+binaries reject minor version 1. Read-only inspection does not migrate stores.
+
+In 2.1, applying any metadata action with nlink=0 first creates and fsyncs an empty
+pending/ID marker and its directory, before the transaction journal can be cleared.
+Open descriptors defer collection without removing that marker. Collection deletes
+and syncs the data object, then deletes and syncs the sidecar, then removes and syncs
+the pending marker. Repetition tolerates already removed files; a missing sidecar
+with a surviving object is an integrity error, not permission to delete blindly.
+
+Mount replays the journal, processes only pending IDs, and cleans staging. Recovery
+validates references added by the transaction, without loading whole parent logs.
+No object-page enumeration or root directory-log scan runs on normal 2.1 mounts.
+Directory logs are validated on use; explicit fsck still performs full validation.
+Mount cost depends on outstanding work, not total objects or historical deletes.

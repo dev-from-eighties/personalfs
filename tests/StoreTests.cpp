@@ -63,6 +63,96 @@ void contents(Store &s, Id id, const std::string &text)
             "data roundtrip");
     s.release(std::move(h));
 }
+void upgradeAndMountCost()
+{
+    for (const char *point : {"gc-object", "gc-meta", "migration-cleaned", "superblock.temp-synced", "migration-published"})
+    {
+        Temp t;
+        std::string orphan;
+        {
+            Store s(t.path);
+            auto id = file(s, "/survivor");
+            contents(s, id, "preserved during upgrade");
+            auto doomed = file(s, "/orphan");
+            orphan = t.path + "/" + s.physicalName(doomed);
+            auto h = s.open(doomed, O_RDONLY);
+            s.remove("/orphan", false);
+            // Simulate process exit with an unlinked descriptor: no release/GC.
+        }
+        auto superPath = t.path + "/superblock";
+        std::ifstream input(superPath, std::ios::binary);
+        Bytes bytes((std::istreambuf_iterator<char>(input)), {});
+        auto super = Super::decode(bytes);
+        super.minorVersion = 0;
+        bytes = super.encode();
+        std::ofstream output(superPath, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+        output.close();
+        std::filesystem::remove_all(t.path + "/pending");
+        std::filesystem::remove_all(t.path + "/staging");
+        auto oldTemp = t.path + "/0000000000000000/.pfs-legacy.tmp";
+        std::ofstream(oldTemp) << "abandoned";
+        auto pid = ::fork();
+        if (!pid)
+        {
+            ::setenv("PERSONALFS_FAULT", point, 1);
+            Store s(t.path);
+            ::_exit(10);
+        }
+        int status;
+        ::waitpid(pid, &status, 0);
+        require(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "upgrade boundary not reached");
+        {
+            Store s(t.path);
+            require(!std::filesystem::exists(orphan), "legacy orphan survived upgrade");
+            require(!std::filesystem::exists(oldTemp), "legacy temporary survived upgrade");
+            auto h = s.open(s.resolve("/survivor"), O_RDONLY);
+            std::string preserved(24, '\0');
+            require(s.read(*h, preserved.data(), preserved.size(), 0) == 24 &&
+                        preserved == "preserved during upgrade", "upgrade changed file data");
+            s.release(std::move(h));
+            s.fsck();
+        }
+        Store s(t.path);
+        require(s.metrics.counters["directory_log_bytes_read"] == 0, "mount scanned directory log");
+        require(!s.metrics.histograms.contains("migration"), "upgrade repeated on new format");
+    }
+    Temp t;
+    std::uint64_t baseline;
+    {
+        Store s(t.path);
+        baseline = s.metrics.counters["openat_calls"];
+        for (unsigned i = 0; i < 100; ++i) file(s, "/f" + std::to_string(i));
+    }
+    {
+        Store s(t.path);
+        require(s.metrics.counters["openat_calls"] == baseline, "mount cost grows with object count");
+        require(s.metrics.counters["directory_log_bytes_read"] == 0, "mount scanned root history");
+    }
+}
+void pendingOpenDeletion()
+{
+    Temp t;
+    std::string path;
+    {
+        Store s(t.path);
+        auto id = file(s, "/open");
+        path = t.path + "/" + s.physicalName(id);
+        auto h = s.open(id, O_RDWR);
+        s.remove("/open", false);
+        require(std::filesystem::exists(path), "open unlinked object collected too early");
+        require(std::filesystem::exists(t.path + "/pending/" + std::to_string(id)), "missing durable pending marker");
+        require(s.write(*h, "data", 4, 0) == 4, "unlinked descriptor unusable");
+        // Destroying the daemon loses in-memory open counts without calling release.
+    }
+    {
+        Store s(t.path);
+        require(!std::filesystem::exists(path), "unlinked object not recovered");
+        require(std::filesystem::is_empty(t.path + "/pending"), "pending marker not retired");
+        require(s.metrics.counters["pending_deletions_recovered"] == 1, "pending cleanup count");
+        s.fsck();
+    }
+}
 void format()
 {
     auto super = Super{}.encode();
@@ -472,7 +562,7 @@ void symlinkDefense()
     try
     {
         Store s(t.path);
-        s.resolve("/file");
+        s.getattr(s.resolve("/file"));
         throw std::runtime_error("physical symlink accepted");
     }
     catch (const std::system_error &e)
@@ -563,6 +653,8 @@ int main(int argc, char **argv)
             return 0;
         }
         format();
+        upgradeAndMountCost();
+        pendingOpenDeletion();
         functional();
         deepAndCache();
         concurrent();

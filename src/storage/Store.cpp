@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -290,7 +291,7 @@ void Store::atomicFile(int dir, const std::string &name, const Bytes &bytes)
     auto stamp = now();
     auto tmp = ".pfs-" + std::to_string(::getpid()) + "-" + std::to_string(stamp.tv_nsec) + "-" +
                std::to_string(++tempCounter_) + ".tmp";
-    Fd f(checked(openAt(dir, tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600),
+    Fd f(checked(openAt(staging_.get(), tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600),
                  "create metadata temporary"));
     try
     {
@@ -300,15 +301,16 @@ void Store::atomicFile(int dir, const std::string &name, const Bytes &bytes)
         syncFd(f.get());
         fault("temp-synced");
         fault((name + ".temp-synced").c_str());
-        checked(::renameat(dir, tmp.c_str(), dir, name.c_str()), "publish metadata");
+        checked(::renameat(staging_.get(), tmp.c_str(), dir, name.c_str()), "publish metadata");
         metrics.count("renameat_calls");
         fault("temp-published");
         fault((name + ".temp-published").c_str());
         syncFd(dir);
+        syncFd(staging_.get());
     }
     catch (...)
     {
-        ::unlinkat(dir, tmp.c_str(), 0);
+        ::unlinkat(staging_.get(), tmp.c_str(), 0);
         throw;
     }
 }
@@ -363,6 +365,8 @@ void Store::init(const std::string &path, std::uint32_t pageSize)
     m.uid = ::getuid();
     m.gid = ::getgid();
     m.atime = m.mtime = m.ctime = now();
+    checked(::mkdirat(root.get(), "staging", 0700), "initialize staging");
+    checked(::mkdirat(root.get(), "pending", 0700), "initialize pending");
     put("lock", {});
     put("0.obj", directoryHeader(0));
     put("0.meta", m.encode());
@@ -389,8 +393,29 @@ Store::Store(const std::string &path, Mode mode, std::size_t cacheBytes)
     super_ = Super::decode(readFile(root_.get(), "superblock", 4096));
     if (writable_)
     {
+        const bool migrating = super_.minorVersion == 0;
+        for (const char *name : {"staging", "pending"})
+        {
+            if (migrating && ::mkdirat(root_.get(), name, 0700) && errno != EEXIST)
+                fail(errno, "create recovery directory");
+        }
+        if (migrating)
+            syncFd(root_.get());
+        staging_ = Fd(checked(openAt(root_.get(), "staging", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), "open staging"));
+        pending_ = Fd(checked(openAt(root_.get(), "pending", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), "open pending"));
         recover();
-        cleanup();
+        if (migrating)
+        {
+            Timer timer(metrics, "migration");
+            std::cerr << "personalfs: upgrading store 2.0 -> 2.1; one-time object cleanup may take time\n";
+            cleanup(); // Only legacy stores require global discovery, once.
+            fault("migration-cleaned");
+            super_.minorVersion = 1;
+            saveSuper(); // Publish the format gate only after durable cleanup.
+            fault("migration-published");
+            std::cerr << "personalfs: store upgrade to 2.1 completed\n";
+        }
+        cleanupPending();
     }
     else
     {
@@ -403,7 +428,7 @@ Store::Store(const std::string &path, Mode mode, std::size_t cacheBytes)
     }
     auto rootMeta = metadata(0);
     check(rootMeta.kind == Kind::Directory && rootMeta.parent == 0 && rootMeta.nlink == 1, "invalid root");
-    scan(0, [](const Record &) {});
+    // Directory logs are validated on access, not scanned at mount.
 }
 Store::~Store() = default;
 void Store::guard()
@@ -859,6 +884,16 @@ void Store::apply(const Transaction &tx)
         {
             // Full sidecar with expected old generation, atomically published.
             auto target = Meta::decode(a.bytes);
+            if (!target.nlink)
+            {
+                // The redo journal protects this publication until the tombstone
+                // and its pending marker are both durable.
+                Fd marker(checked(openAt(pending_.get(), std::to_string(a.id).c_str(),
+                                         O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600), "register pending deletion"));
+                syncFd(marker.get());
+                syncFd(pending_.get());
+                fault("pending-registered");
+            }
             check(target.id == a.id, "redo metadata identity");
             try
             {
@@ -951,16 +986,27 @@ void Store::recover()
     auto tx = decodeTransaction(b);
     apply(tx);
     metrics.count("recovered_transactions");
-    for (auto &action : tx.actions)
+    // Validate only references introduced by this transaction, not the full
+    // accumulated histories of its parent directories.
+    for (const auto &action : tx.actions)
     {
-        if (action.type == 3)
+        if (action.type != 3)
+            continue;
+        std::size_t offset = 0;
+        while (offset < action.bytes.size())
         {
-            for (auto &[name, entry] : list(action.id))
+            Decoder header{action.bytes, offset + 8};
+            auto length = std::uint64_t(header.u32()) + 16;
+            check(length <= action.bytes.size() - offset, "invalid recovered record length");
+            Record record = Record::decode(Bytes(action.bytes.begin() + offset,
+                                                action.bytes.begin() + offset + length));
+            if (record.add)
             {
-                (void)name;
-                auto child = metadata(entry.id);
-                check(child.nlink == 1 && child.kind == entry.kind, "recovered dangling reference");
+                auto child = metadata(record.entry.id);
+                check(child.nlink == 1 && child.kind == record.entry.kind && child.parent == action.id,
+                      "recovered dangling reference");
             }
+            offset += length;
         }
     }
     atomicFile(root_.get(), "journal", {});
@@ -1292,7 +1338,28 @@ void Store::collect(Id id)
         if (openCounts_.contains(id))
             return;
     }
-    auto m = metadata(id);
+    Meta m;
+    try
+    {
+        m = metadata(id);
+    }
+    catch (const std::system_error &e)
+    {
+        if (e.code().value() != ENOENT)
+            throw;
+        // A durable pending marker may outlive both files.
+        auto p = location(id);
+        struct stat st{};
+        if (::fstatat(p.directory.get(), (p.base + ".obj").c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0)
+            fail(EIO, "pending object lacks tombstone");
+        if (errno != ENOENT)
+            fail(errno, "stat pending object");
+        syncFd(p.directory.get());
+        if (::unlinkat(pending_.get(), std::to_string(id).c_str(), 0) && errno != ENOENT)
+            fail(errno, "remove completed pending deletion");
+        syncFd(pending_.get());
+        return;
+    }
     if (m.nlink)
         return;
     auto p = location(id);
@@ -1306,6 +1373,10 @@ void Store::collect(Id id)
         fail(errno, "collect sidecar");
     fault("gc-meta");
     syncFd(p.directory.get());
+    if (::unlinkat(pending_.get(), std::to_string(id).c_str(), 0) && errno != ENOENT)
+        fail(errno, "remove pending deletion");
+    syncFd(pending_.get());
+    fault("pending-completed");
     invalidate(id);
 }
 ssize_t Store::read(Handle &h, void *data, std::size_t size, off_t offset)
@@ -1495,7 +1566,7 @@ void Store::compact(Id id)
     auto p = location(id);
     auto tmp = ".pfs-c-" + std::to_string(::getpid()) + "-" + std::to_string(++tempCounter_) + ".tmp";
     Fd f(checked(
-        openAt(p.directory.get(), tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600),
+        openAt(staging_.get(), tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600),
         "compact temporary"));
     try
     {
@@ -1507,17 +1578,18 @@ void Store::compact(Id id)
         if (current != generation)
             fail(EAGAIN, "directory changed during compaction; retry");
         metrics.count("renameat_calls");
-        checked(::renameat(p.directory.get(), tmp.c_str(), p.directory.get(), (p.base + ".obj").c_str()),
+        checked(::renameat(staging_.get(), tmp.c_str(), p.directory.get(), (p.base + ".obj").c_str()),
                 "publish compaction");
         fault("compact-published");
         syncFd(p.directory.get());
+        syncFd(staging_.get());
         invalidate(id);
         metrics.count("compaction_reclaimed_bytes",
                       beforeSize > e.bytes.size() ? beforeSize - e.bytes.size() : 0);
     }
     catch (...)
     {
-        ::unlinkat(p.directory.get(), tmp.c_str(), 0);
+        ::unlinkat(staging_.get(), tmp.c_str(), 0);
         throw;
     }
 }
@@ -1554,6 +1626,38 @@ std::vector<Id> Store::objects()
         }
     }
     return {ids.begin(), ids.end()};
+}
+void Store::cleanupPending()
+{
+    Timer timer(metrics, "pending_cleanup");
+    for (const auto &name : names(pending_.get(), &metrics))
+    {
+        std::size_t consumed = 0;
+        Id id = std::stoull(name, &consumed);
+        check(consumed == name.size() && std::to_string(id) == name && id > 0 && id < super_.nextId,
+              "invalid pending deletion ID");
+        // Recovery has completed; a linked object is never eligible for GC.
+        try
+        {
+            check(metadata(id).nlink == 0, "pending deletion refers to linked object");
+        }
+        catch (const std::system_error &e)
+        {
+            if (e.code().value() != ENOENT)
+                throw;
+        }
+        collect(id);
+        metrics.count("pending_deletions_recovered");
+    }
+    bool changed = false;
+    for (const auto &name : names(staging_.get(), &metrics))
+    {
+        check(name.starts_with(".pfs-") && name.ends_with(".tmp"), "unexpected staging entry");
+        checked(::unlinkat(staging_.get(), name.c_str(), 0), "remove abandoned staging file");
+        changed = true;
+    }
+    if (changed)
+        syncFd(staging_.get());
 }
 void Store::cleanup()
 {
@@ -1680,6 +1784,7 @@ std::string Store::inspect(std::optional<Id> id)
             maxEntries = std::max<std::uint64_t>(maxEntries, count);
         }
         o << "{\"format_version\":2,\"objects\":" << objects().size()
+          << ",\"format_minor\":" << super_.minorVersion
           << ",\"objects_per_page\":" << super_.pageSize
           << ",\"page_encoding\":\"hex16\",\"next_object_id\":" << super_.nextId
           << ",\"next_txid\":" << super_.nextTx << ",\"pages\":" << pages

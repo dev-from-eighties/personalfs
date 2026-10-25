@@ -36,6 +36,7 @@ Bytes seal(const std::string &magic, const Bytes &payload);
 Bytes unseal(const std::string &magic, const Bytes &bytes);
 struct Super
 {
+    std::uint32_t minorVersion = 1;
     std::uint32_t pageSize = 4096;
     Id nextId = 1;
     std::uint64_t nextTx = 1;

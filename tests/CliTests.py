@@ -20,10 +20,11 @@ with tempfile.TemporaryDirectory(prefix="pfs-cli-test-") as parent:
     run("v2", "init", store, "--objects-per-page", "1024")
     info = json.loads(run("inspect", store))
     assert info["format_version"] == 2
+    assert info["format_minor"] == 1
     assert info["objects_per_page"] == 1024
-    before = {p.name: p.read_bytes() for p in store.iterdir()}
+    before = {str(p.relative_to(store)): p.read_bytes() for p in store.rglob("*") if p.is_file()}
     assert json.loads(run("fsck", store, "--check"))["objects"] == 1
-    after = {p.name: p.read_bytes() for p in store.iterdir()}
+    after = {str(p.relative_to(store)): p.read_bytes() for p in store.rglob("*") if p.is_file()}
     assert before == after, "read-only fsck modified files"
     root = json.loads(run("inspect", store, "--object", "0"))
     assert root["object_id"] == 0 and root["kind"] == 2

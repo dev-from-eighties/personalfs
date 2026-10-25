@@ -111,7 +111,7 @@ Bytes Super::encode() const
 {
     Encoder e;
     e.u32(2);
-    e.u32(0);
+    e.u32(minorVersion);
     e.u32(pageSize);
     e.u32(16);
     e.u64(0);
@@ -125,7 +125,9 @@ Super Super::decode(const Bytes &bytes)
     auto p = unseal("PFS2SUPR", bytes);
     Decoder d{p};
     Super s;
-    check(d.u32() == 2 && d.u32() == 0, "unsupported format version");
+    check(d.u32() == 2, "unsupported format version");
+    s.minorVersion = d.u32();
+    check(s.minorVersion <= 1, "unsupported format version");
     s.pageSize = d.u32();
     check(s.pageSize >= 1 && s.pageSize <= 16384, "invalid objects_per_page");
     check(d.u32() == 16, "unsupported page encoding");

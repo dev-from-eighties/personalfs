@@ -132,7 +132,7 @@ class Store
         std::size_t bytes;
         std::uint64_t used;
     };
-    Fd root_, lock_;
+    Fd root_, lock_, staging_, pending_;
     Super super_;
     bool writable_;
     std::atomic<bool> poisoned_{false};
@@ -172,6 +172,7 @@ class Store
     void collect(Id id);
     std::vector<Id> objects();
     void cleanup();
+    void cleanupPending();
 };
 void fault(const char *point);
 } // namespace personalfs

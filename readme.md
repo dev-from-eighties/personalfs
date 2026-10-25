@@ -160,3 +160,17 @@ The local backend tests are not a substitute for mounted POSIX tests, a 30 GiB S
 copy from Nautilus, HDD benchmarks, or controlled power-loss testing. SIGKILL does
 not simulate storage losing previously acknowledged writes. P1 hardware/power-loss
 validation remains a production gate from the specification.
+
+## Fast mount and in-place upgrade
+
+New stores use format 2.1. Existing v2/2.0 stores upgrade automatically on their
+first writable open (including mount), under the exclusive store lock. Stop the
+old daemon and use the new binary with the same store path; no second store or
+data copy is required. This first open performs one legacy cleanup and can be slow.
+If interrupted, migration resumes safely on the next writable open. After upgrade,
+older binaries reject the store; downgrade is not supported.
+
+Subsequent mounts recover only the transaction journal, pending deletions and
+abandoned staging files. They never enumerate all objects or scan the accumulated
+root directory log. Open-file deletions remain registered until physical cleanup
+completes. Full integrity scans remain available through explicit `fsck`.
